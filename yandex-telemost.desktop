@@ -1,0 +1,13 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Яндекс Телемост
+GenericName=Видеовстречи
+Comment=Видеозвонки и конференции Яндекс Телемост
+Exec=/usr/local/bin/yandex-telemost %u
+Terminal=false
+Icon=yandex-telemost
+StartupWMClass=yandex-telemost
+Categories=Network;VideoConference;AudioVideo;
+MimeType=x-scheme-handler/telemost;
+Keywords=telemost;yandex;video;call;meet;телемост;яндекс;звонки;

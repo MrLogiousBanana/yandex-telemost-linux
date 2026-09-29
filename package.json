@@ -1,0 +1,7 @@
+{
+  "name": "yandex-telemost",
+  "productName": "yandex-telemost",
+  "version": "1.0.0",
+  "description": "Яндекс Телемост для Linux",
+  "main": "main.js"
+}
