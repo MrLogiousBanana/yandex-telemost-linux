@@ -9,39 +9,106 @@ let mainWindow = null;
 const USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36";
 
 /**
- * Extracts meeting ID from URL (e.g. /j/1234567890 -> 1234567890)
+ * Unwraps redirect wrappers (like sba.yandex.net/redirect?url=...) and strips
+ * custom protocol prefixes (telemost://ychat/, telemost://, telemost:, ychat://, ychat:).
  */
-function getMeetingId(url) {
-    if (!url || typeof url !== "string") return null;
-    const match = url.match(/\/j\/([a-zA-Z0-9_-]+)/);
-    return match ? match[1] : null;
+function extractRawTargetUrl(rawUrl) {
+    if (!rawUrl || typeof rawUrl !== "string") return "";
+    let clean = rawUrl.trim();
+
+    // 1. Check if this is an HTTP(S) redirect wrapper with a ?url= parameter
+    if (clean.startsWith("http://") || clean.startsWith("https://")) {
+        try {
+            const parsed = new URL(clean);
+            const embeddedUrl = parsed.searchParams.get("url") || parsed.searchParams.get("retpath");
+            if (embeddedUrl && (embeddedUrl.includes("telemost") || embeddedUrl.includes("/j/") || embeddedUrl.includes("%2Fj%2F"))) {
+                clean = embeddedUrl.trim();
+            }
+        } catch (e) {}
+    }
+
+    // 2. Strip custom protocol and ychat prefixes iteratively
+    const stripPrefixes = (str) => {
+        let s = str;
+        let changed = true;
+        while (changed) {
+            changed = false;
+            for (const prefix of [
+                "telemost://ychat/",
+                "telemost:ychat/",
+                "telemost://",
+                "telemost:",
+                "ychat://",
+                "ychat:",
+                "ychat/"
+            ]) {
+                if (s.startsWith(prefix)) {
+                    s = s.slice(prefix.length);
+                    changed = true;
+                }
+            }
+        }
+        return s;
+    };
+
+    clean = stripPrefixes(clean);
+
+    // 3. Decode percent-encoding if needed (e.g. telemost://https%3A%2F%2F...)
+    if (!clean.startsWith("http://") && !clean.startsWith("https://") && (clean.includes("%3A") || clean.includes("%2F") || clean.includes("%3a") || clean.includes("%2f"))) {
+        try {
+            clean = decodeURIComponent(clean);
+        } catch (e) {}
+        clean = stripPrefixes(clean);
+    }
+
+    return clean;
 }
 
 /**
- * Normalizes any incoming Telemost meeting argument or URL.
- * Handles:
- * - telemost://https://telemost.yandex.ru/j/<id>
- * - telemost:https://telemost.yandex.ru/j/<id>
- * - telemost://telemost.yandex.ru/j/<id>
- * - telemost://j/<id>
- * - telemost:<meetingId>
- * - telemost://<meetingId>
- * - https://telemost.yandex.ru/j/<id>
- * - https://360.yandex.ru/telemost/j/<id>
- * Ensures skip_app=1 is added so web client bypasses browser detection.
+ * Extracts meeting ID from any URL or deeplink (e.g. /j/1234567890 -> 1234567890)
+ */
+function getMeetingId(url) {
+    const clean = extractRawTargetUrl(url);
+    if (!clean) return null;
+    const match = clean.match(/\/j\/([a-zA-Z0-9_-]+)/);
+    if (match) return match[1];
+    if (/^\d{10,}$/.test(clean)) return clean;
+    return null;
+}
+
+/**
+ * Determines whether to use telemost.360.yandex.ru (B2B / Yandex 360) or telemost.yandex.ru
+ * so that navigating to a meeting never triggers a disruptive cross-domain Legal redirect.
+ */
+function getPreferredTelemostOrigin(hintUrl) {
+    if (hintUrl && typeof hintUrl === "string" && (hintUrl.includes("telemost.360.yandex.") || hintUrl.includes("360.yandex."))) {
+        return "https://telemost.360.yandex.ru";
+    }
+    if (mainWindow && !mainWindow.isDestroyed()) {
+        try {
+            const currentUrl = mainWindow.webContents.getURL();
+            if (currentUrl && currentUrl.includes("telemost.360.yandex.")) {
+                return "https://telemost.360.yandex.ru";
+            }
+        } catch (e) {}
+    }
+    return "https://telemost.yandex.ru";
+}
+
+/**
+ * Normalizes any incoming Telemost meeting argument or URL into a direct
+ * canonical https://telemost(.360).yandex.ru/j/<id>?skip_app=1 URL.
  */
 function normalizeMeetingUrl(rawUrl) {
-    if (!rawUrl || typeof rawUrl !== "string") return "https://telemost.yandex.ru/";
-    let clean = rawUrl.trim();
+    const origin = getPreferredTelemostOrigin(rawUrl);
+    if (!rawUrl || typeof rawUrl !== "string") return origin + "/";
 
-    try {
-        if (clean.includes("%3A") || clean.includes("%2F") || clean.includes("%3a") || clean.includes("%2f")) {
-            clean = decodeURIComponent(clean);
-        }
-    } catch (e) {}
+    const clean = extractRawTargetUrl(rawUrl);
+    const meetingId = getMeetingId(clean);
 
-    while (clean.startsWith("telemost://") || clean.startsWith("telemost:")) {
-        clean = clean.startsWith("telemost://") ? clean.slice(11) : clean.slice(9);
+    if (meetingId) {
+        const targetOrigin = getPreferredTelemostOrigin(clean);
+        return `${targetOrigin}/j/${meetingId}?skip_app=1`;
     }
 
     let target;
@@ -49,12 +116,8 @@ function normalizeMeetingUrl(rawUrl) {
         target = clean;
     } else if (clean.startsWith("telemost.yandex.") || clean.startsWith("360.yandex.") || clean.startsWith("telemost.360.yandex.")) {
         target = "https://" + clean;
-    } else if (clean.startsWith("j/") || clean.startsWith("/j/")) {
-        target = "https://telemost.yandex.ru/" + clean.replace(/^\/+/, "");
-    } else if (/^[a-zA-Z0-9_-]+$/.test(clean) && !clean.includes("/") && !clean.includes(".")) {
-        target = "https://telemost.yandex.ru/j/" + clean;
     } else {
-        target = "https://telemost.yandex.ru/" + clean.replace(/^\/+/, "");
+        target = origin + "/" + clean.replace(/^\/+/, "");
     }
 
     try {
@@ -68,30 +131,55 @@ function normalizeMeetingUrl(rawUrl) {
     }
 }
 
+/**
+ * Checks if a CLI argument is a Telemost URL or meeting link
+ */
+function isCliMeetingArg(arg) {
+    if (!arg || typeof arg !== "string") return false;
+    if (arg.includes("node_modules") || arg.endsWith(".js") || arg.startsWith("/opt/") || arg.startsWith("-")) {
+        return false;
+    }
+    return (
+        arg.startsWith("telemost:") ||
+        arg.startsWith("ychat:") ||
+        arg.includes("telemost.yandex.") ||
+        arg.includes("telemost.360.yandex.") ||
+        arg.includes("360.yandex.ru/telemost") ||
+        Boolean(getMeetingId(arg))
+    );
+}
+
+/**
+ * Opens a normalized meeting URL in mainWindow unless that exact meeting is already open
+ */
+function openMeetingInMainWindow(rawUrl) {
+    if (!mainWindow || mainWindow.isDestroyed()) return;
+    if (mainWindow.isMinimized()) mainWindow.restore();
+    mainWindow.focus();
+
+    const targetUrl = normalizeMeetingUrl(rawUrl);
+    const currentUrl = mainWindow.webContents.getURL();
+    const targetId = getMeetingId(targetUrl);
+    const currentId = getMeetingId(currentUrl);
+
+    if (!targetId || targetId !== currentId) {
+        mainWindow.loadURL(targetUrl);
+    }
+}
+
 // Single instance lock
 const gotTheLock = app.requestSingleInstanceLock();
 if (!gotTheLock) {
     app.quit();
 } else {
-    app.on("second-instance", (event, commandLine, workingDirectory) => {
+    app.on("second-instance", (event, commandLine) => {
         if (mainWindow && !mainWindow.isDestroyed()) {
             if (mainWindow.isMinimized()) mainWindow.restore();
             mainWindow.focus();
 
-            const meetingArg = commandLine.find(arg =>
-                arg.startsWith("telemost:") ||
-                arg.includes("telemost.yandex.ru/j/") ||
-                arg.includes("360.yandex.ru/telemost/j/") ||
-                (arg.includes("/j/") && !arg.includes("node_modules") && !arg.includes(".js") && !arg.includes("/opt/"))
-            );
+            const meetingArg = commandLine.find(isCliMeetingArg);
             if (meetingArg) {
-                const targetUrl = normalizeMeetingUrl(meetingArg);
-                const currentUrl = mainWindow.webContents.getURL();
-                const targetId = getMeetingId(targetUrl);
-                const currentId = getMeetingId(currentUrl);
-                if (!targetId || targetId !== currentId) {
-                    mainWindow.loadURL(targetUrl);
-                }
+                openMeetingInMainWindow(meetingArg);
             }
         }
     });
@@ -103,28 +191,29 @@ if (!gotTheLock) {
 function setupWebContentsNavigation(contents) {
     // Intercept in-page HTTP / link navigations
     contents.on("will-navigate", (event, navUrl) => {
-        if (navUrl.startsWith("telemost:")) {
+        if (navUrl.startsWith("telemost:") || navUrl.startsWith("ychat:")) {
             event.preventDefault();
-            if (contents === (mainWindow && mainWindow.webContents)) {
-                const target = normalizeMeetingUrl(navUrl);
-                const currentUrl = mainWindow.webContents.getURL();
-                const targetId = getMeetingId(target);
-                const currentId = getMeetingId(currentUrl);
-                if (!targetId || targetId !== currentId) {
-                    if (mainWindow.isMinimized()) mainWindow.restore();
-                    mainWindow.focus();
-                    mainWindow.loadURL(target);
-                }
-            }
+            openMeetingInMainWindow(navUrl);
             return;
         }
 
-        if (contents === (mainWindow && mainWindow.webContents) && navUrl.includes("/j/") && (navUrl.includes("telemost.yandex.") || navUrl.includes("360.yandex."))) {
+        const isMain = mainWindow && !mainWindow.isDestroyed() && contents === mainWindow.webContents;
+        const meetingId = getMeetingId(navUrl);
+
+        if (meetingId) {
+            if (!isMain) {
+                // A popup window (e.g. Calendar) is navigating to a meeting link -> route to mainWindow
+                event.preventDefault();
+                openMeetingInMainWindow(navUrl);
+                return;
+            }
+
             try {
                 const u = new URL(navUrl);
-                if (u.searchParams.get("skip_app") !== "1") {
+                const preferredOrigin = getPreferredTelemostOrigin(navUrl);
+                if (u.searchParams.get("skip_app") !== "1" || u.origin !== preferredOrigin) {
                     event.preventDefault();
-                    contents.loadURL(normalizeMeetingUrl(navUrl));
+                    mainWindow.loadURL(normalizeMeetingUrl(navUrl));
                 }
             } catch (e) {}
         }
@@ -132,17 +221,8 @@ function setupWebContentsNavigation(contents) {
 
     // Intercept window.open / target="_blank"
     contents.setWindowOpenHandler(({ url }) => {
-        if (url.startsWith("telemost:")) {
-            const target = normalizeMeetingUrl(url);
-            if (mainWindow && !mainWindow.isDestroyed()) {
-                if (mainWindow.isMinimized()) mainWindow.restore();
-                mainWindow.focus();
-                const targetId = getMeetingId(target);
-                const currentId = getMeetingId(mainWindow.webContents.getURL());
-                if (!targetId || targetId !== currentId) {
-                    mainWindow.loadURL(target);
-                }
-            }
+        if (url.startsWith("telemost:") || url.startsWith("ychat:") || getMeetingId(url)) {
+            openMeetingInMainWindow(url);
             return { action: "deny" };
         }
 
@@ -153,23 +233,9 @@ function setupWebContentsNavigation(contents) {
             return { action: "deny" };
         }
 
-        if ((url.includes("telemost.yandex.") || url.includes("telemost.360.yandex.") || url.includes("360.yandex.ru/telemost")) && url.includes("/j/")) {
-            const target = normalizeMeetingUrl(url);
-            if (mainWindow && !mainWindow.isDestroyed()) {
-                if (mainWindow.isMinimized()) mainWindow.restore();
-                mainWindow.focus();
-                const targetId = getMeetingId(target);
-                const currentId = getMeetingId(mainWindow.webContents.getURL());
-                if (!targetId || targetId !== currentId) {
-                    mainWindow.loadURL(target);
-                }
-            }
-            return { action: "deny" };
-        }
-
         if (url.includes("telemost.yandex.") || url.includes("telemost.360.yandex.") || url.includes("360.yandex.ru/telemost")) {
             if (mainWindow && !mainWindow.isDestroyed()) {
-                mainWindow.loadURL(url);
+                mainWindow.loadURL(normalizeMeetingUrl(url));
             }
             return { action: "deny" };
         }
@@ -200,7 +266,7 @@ function createWindow() {
         callback(allowedPermissions.includes(permission));
     });
 
-    ses.setPermissionCheckHandler((webContents, permission, requestingOrigin) => {
+    ses.setPermissionCheckHandler(() => {
         return true;
     });
 
@@ -266,12 +332,7 @@ function createWindow() {
     // If meeting URL passed via CLI, open it normalized, else home page
     let startUrl = "https://telemost.yandex.ru/";
     const args = process.argv.slice(1);
-    const meetingArg = args.find(arg =>
-        arg.startsWith("telemost:") ||
-        arg.includes("telemost.yandex.ru/j/") ||
-        arg.includes("360.yandex.ru/telemost/j/") ||
-        (arg.includes("/j/") && !arg.includes("node_modules") && !arg.includes(".js") && !arg.includes("/opt/"))
-    );
+    const meetingArg = args.find(isCliMeetingArg);
     if (meetingArg) {
         startUrl = normalizeMeetingUrl(meetingArg);
     }
